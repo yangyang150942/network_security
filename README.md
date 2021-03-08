@@ -28,8 +28,11 @@ The main config files of the FreeRadius server are already contained. We mainly 
 /etc/freeradius/3.0/clients.cnf
 Remember to configure the router which needs to be the FreeRadius client, modifying the encryption method to “WPA(2)-EAP”.
 We also have created our own certificates files in
+
 /etc/freeradius/3.0/certs/
+
 To generate new user certificates, just modify the client.cnf in this directory according to the actual situation of users.
+
 [ req ]
 …...
 default_bits		= 4096
@@ -37,6 +40,7 @@ distinguished_name	= client
 input_password		= user_password
 output_password		= user_password
 …...
+
 [client]
 countryName		= ...
 stateOrProvinceName	= ...
@@ -44,6 +48,7 @@ localityName		= ...
 organizationName	= ...
 emailAddress		= ...
 commonName		= ...
+
 After modifying the config, run the following command to generate client certificates. Distribute the second certificate to Android mobile phone users.
 make client.pem
 make client_android.p12
