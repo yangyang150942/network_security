@@ -57,7 +57,7 @@ To start the FreeRadius server, run:<br>
 
 If everything works correctly, “Ready to process requests” will be shown. Then connect Wifi using the Android mobile phone and attaching the user certificate, and the connection can be created.For more details, please refer to:<br>
 https://www.ossramblings.com/RADIUS-3.X-Server-on-Ubuntu-14.04-for-WIFI-Auth<br>
-##VM3
+## VM3
 VM3 will be used to serve as a VPN client and a gateway. To run this client, we have already created this client file named `LondonClient.conf`. We have also enabled IP forwarding by modifying the `/etc/sysctl.conf` file. You can simply copy the etc folder and replace it in your VM. Then reboot the VM. <br>
 For configuration details, please refer to:<br>
 https://openvpn.net/vpn-server-resources/site-to-site-routing-explained-in-detail/ 
