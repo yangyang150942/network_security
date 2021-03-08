@@ -1,14 +1,14 @@
 # EP2520_ACME_Project
- 
-VM1
+## VM1
+This VM is used as a VPN access server. And there is an intrusion detection for interface enp0s3.<br>
+For IDS, you can just copy the etc folder in your VM and use the command:<br>
 
-This VM is used as a VPN access server. And there is an intrusion detection for interface enp0s3.
-For IDS, you can just copy the etc folder in your VM and use the command:
-sudo snort -A console -i eth0 -u snort -g snort -c /etc/snort/snort.conf
+* sudo snort -A console -i eth0 -u snort -g snort -c /etc/snort/snort.conf
+
 to start. You need to change eth0 to the interface you want to listen to. And you need to change “ipvar HOME_NET server_public_ip/32” in the /etc/snort/snort.conf file to the network addresses you are protecting. You can add more rules by editing the /etc/snort/rules/local.rules file. The log will show in the terminal. For more information, you can read the reference from the reference of Documentation
 For VPN, you can configure your own one by following the guide from the reference of Documentation which shows each detail in how to use OpenVPN to set up a VPN access server and how to get an ovpn file for clients. But before that, you need to build a CA and produce a private key and self-signature certification for the server. And to make your configuration work, you need to set static routes and port forwarding.
  
-VM2
+## VM2
 
 The Web server and the FreeRadius server are set up on VM2.
 To set up the Web server, Apache2, MySQL, and PHP should be installed first. The file /etc/apache2/sites-available/fosslinuxowncloud.com.conf is the new virtual host file, which needs to be enabled to replace the default file:
