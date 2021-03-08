@@ -1,0 +1,13 @@
+[Unit]
+Description=Mount unit for snapd, revision 11107
+Before=snapd.service
+
+[Mount]
+What=/var/lib/snapd/snaps/snapd_11107.snap
+Where=/snap/snapd/11107
+Type=squashfs
+Options=nodev,ro,x-gdu.hide
+LazyUnmount=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,13 @@
+[Unit]
+Description=Mount unit for nmap, revision 2254
+Before=snapd.service
+
+[Mount]
+What=/var/lib/snapd/snaps/nmap_2254.snap
+Where=/snap/nmap/2254
+Type=squashfs
+Options=nodev,ro,x-gdu.hide
+LazyUnmount=yes
+
+[Install]
+WantedBy=multi-user.target

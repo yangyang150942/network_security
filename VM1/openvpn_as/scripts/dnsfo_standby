@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+if [ -z "$OPENVPN_AS_NOEXPORT" ]; then
+export AS_VERSION="2.8.7"
+export AS_BUILD="c7d6c210"
+export OPENVPN_AS_BASE="/usr/local/openvpn_as"
+export OPENVPN_AS_CONFIG="/usr/local/openvpn_as/etc/as.conf"
+export PATH="/usr/local/openvpn_as/scripts:/usr/local/openvpn_as/bin:/usr/local/openvpn_as/sbin:$PATH"
+export LD_LIBRARY_PATH="/usr/local/openvpn_as/lib"
+export PYTHONPATH=":/usr/local/openvpn_as/lib/python2.7/site-packages:/usr/local/openvpn_as/lib/python2.7/site-packages"
+fi
+export PYOVPN_CMDNAME="dnsfo_standby"
+python2 -c "from pyovpn.sagent.sagent_entry import dnsfo_standby ; dnsfo_standby()" "$@"

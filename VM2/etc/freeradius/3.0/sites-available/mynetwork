@@ -1,0 +1,61 @@
+######################################################################
+server{
+listen {
+        type = auth
+        port = 1812
+        ipaddr = *
+    }
+authorize {
+	preprocess
+	eap {
+		ok = return
+	}
+#	if (User-Name == 'user1') {
+#               update control {
+#                        Cleartext-Password := 'bnssgroup10'
+#                }
+#        }
+
+	expiration
+	logintime
+	pap
+}
+
+authenticate {	
+	eap
+}
+
+preacct {
+	preprocess
+	acct_unique	
+	suffix
+	files
+}
+
+accounting {
+	detail
+	unix
+	radutmp
+	exec
+	attr_filter.accounting_response
+}
+
+session {
+	radutmp
+}
+
+post-auth {
+	exec
+	Post-Auth-Type REJECT {
+		attr_filter.access_reject
+	}
+}
+
+pre-proxy {
+
+}
+
+post-proxy {
+	eap
+}
+}

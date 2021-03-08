@@ -1,0 +1,1213 @@
+#!/usr/bin/python2
+# Imports...
+# silence annoying warning messages about deprecated features
+import pyovpn.python.nodepwarn
+import pkg_resources
+pkg_resources.require("pyovpn")
+import pyovpn
+import pyovpn.util
+from pyovpn.lic.lickey import LicenseKeyString
+from pyovpn.subscription.subhelper import SubscriptionHelper
+from pyovpn.subscription.state import SubscriptionTracking
+from pyovpn.net.net import NetInfoLinux
+from pyovpn.util.simplefile import read_string_from_file, write_string_to_file, read_file_as_line_list, wtfile
+from pyovpn.util.myjson import MyJSONEncoder
+import json
+import os
+import commands
+import re
+import sys
+import pwd
+import getpass
+import warnings
+import time
+import socket
+from twisted.internet import reactor, defer
+from pyovpn.util.error import Passthru
+from pyovpn.util.sock import test_port
+from pyovpn.linux.linfo import get_n_cores
+from pyovpn.eula.eula import get_eula
+from pyovpn.util.ec2 import get_user_dict, get_cidr_list, ec2_get_pub_ip
+from pyovpn.util.gcp import get_user_dict_gcp, get_cidr_list_gcp, gcp_get_pub_ip
+from pyovpn.util.azure import azure_get_pub_ip
+from pyovpn.ctest.ctcli import ConnectivityTestClient
+
+#
+# Default configuration parameters for this script...
+#
+
+# Show debug/verbose output...
+DEBUG = True
+
+# Forces re-initialization...
+FORCE = False
+
+# Where to find pyovpn...
+TOP = "/usr/local/openvpn_as"
+
+# Where to find primary template config...
+AS_TEMPL_CONF = os.path.join(TOP, "etc/as_templ.conf")
+
+# Where to find primary config...
+AS_CONF = os.path.join(TOP, "etc/as.conf")
+
+# Where to find json template config...
+JSON_TEMPL_CONF = os.path.join(TOP, "etc/config_templ.json")
+JSON_TEMPL_CONF_LOCAL = os.path.join(TOP, "etc/config_local_templ.json")
+
+# Where to find primary config...
+JSON_CONF = os.path.join(TOP, "etc/config.json")
+JSON_CONF_LOCAL = os.path.join(TOP, "etc/config-local.json")
+
+# Default port for web...
+DEFAULT_OVPN_PORT = "943"
+
+#
+# Script starts here
+#
+
+eula = get_eula()
+
+
+def get_raw_input(prompt, batch_default=''):
+    if BATCH:
+        print "%s%s" % (prompt, batch_default)
+        return batch_default
+    else:
+        return raw_input(prompt)
+
+
+def print_eula():
+    for l in eula.splitlines():
+        if l == '* * *':
+            break
+        print l
+
+
+def save_eula():
+    SA_CMD = "cat /usr/local/openvpn_as/etc/BUILD | awk '{print $NF}'"
+    retv = commands.getstatusoutput(SA_CMD)
+    eula_updated = re.sub('Copyright \([cC]\) 2009-20[0-9][0-9] OpenVPN Inc',
+                          'Copyright (C) 2009-'+retv[1]+' OpenVPN Inc',  eula)
+    eula_updated = re.sub('Copyright \([cC]\) 2002-20[0-1][0-9] OpenVPN Inc',
+                          'Copyright (C) 2002-'+retv[1]+' OpenVPN Inc', eula_updated)
+
+    wtfile(eula_updated, '/usr/local/openvpn_as/license.txt')
+
+
+def cloud_bool(key, default):
+    s = user_data.get(key, default)
+    if s == '0' or s.lower() == 'false':
+        return 'false'
+    elif s == '1' or s.lower() == 'true':
+        return 'true'
+    else:
+        return default
+
+# TODO: Put code into try/except for more graceful early termination
+
+
+'''Process command line arguments'''
+
+
+def process_args():
+    from optparse import OptionParser
+    usage = "usage: ovpn-init [options]"
+    global parser
+    parser = OptionParser(usage)
+    parser.add_option("", "--verbose", action="store_true", dest="verbose",
+                      help="If this argument is used, verbose output will be generated.")
+    parser.add_option("", "--force", action="store_true", dest="force",
+                      help="If this argument is used, openvpn-as will be re-ilnitialized and all DBs will be wiped!")
+    parser.add_option("", "--batch", action="store_true", dest="batch",
+                      help="If this argument is used, openvpn-as will run in batch mode, and will not solicit input from the tty.  You should not use this option unless you have viewed the EULA and agree to it (use the --view-eula option to view the EULA).  Using this option indicates your agreement with the EULA.")
+    parser.add_option("", "--host", dest="host",
+                      help="Set the FQDN of this server for access from the internet.")
+    parser.add_option("", "--ec2", action="store_true", dest="ec2",
+                      help="Configure using Amazon EC2 user-defined metadata")
+    parser.add_option("", "--gcp", action="store_true", dest="gcp",
+                      help="Configure using Google GCP user-defined metadata")
+    parser.add_option("", "--azure", action="store_true", dest="azure",
+                      help="Configure using MS Azure user-defined metadata")
+    parser.add_option("", "--oracle", action="store_true", dest="oracle",
+                      help="Configure using Oracle Cloud user-defined metadata")
+    parser.add_option("", "--secondary", action="store_true", dest="secondary",
+                      help="If this argument is used, the node will be configured as a secondary node, to be used for backup or standby purposes.")
+    parser.add_option("", "--no_reroute_gw", action="store_true", dest="no_reroute_gw",
+                      help="If this argument is used, client traffic will NOT be routed by default through the VPN.")
+    parser.add_option("", "--no_reroute_dns", action="store_true", dest="no_reroute_dns",
+                      help="If this argument is used, client DNS traffic will NOT be routed by default through the VPN.")
+    parser.add_option("", "--no_private", action="store_true", dest="no_private",
+                      help="If this argument is used, private subnets will NOT be accessible to clients by default.")
+    parser.add_option("", "--local_auth", action="store_true", dest="local_auth",
+                      help="Use local authentication via internal DB")
+    parser.add_option("", "--license", dest="license",
+                      help="Optionally, specify an OpenVPN-AS license key")
+    parser.add_option("", "--no_start", action="store_true", dest="no_start",
+                      help="Don't automatically start the the Access Server daemon at the conclusion of the script.")
+    parser.add_option("", "--view-eula", action="store_true", dest="view_eula",
+                      help="View the EULA (End User License Agreement).")
+
+    return parser.parse_args()
+
+
+# Save EULA
+save_eula()
+
+# Get command line arguments...
+(opts, args) = process_args()
+
+# View eula only?
+if opts.view_eula:
+    print_eula()
+    sys.exit(0)
+
+# Get verbose/debug option value from cmd line args...
+DEBUG = opts.verbose
+
+# Get force option...
+FORCE = opts.force
+
+# get batch option
+BATCH = opts.batch
+
+# get FQDN of server
+HOST = opts.host
+
+# get optional license key
+LICENSE = opts.license
+
+# are we running on Amazon EC2?
+EC2 = opts.ec2
+
+# are we running on Google GCP?
+GCP = opts.gcp
+
+# are we running on MS Azure?
+AZURE = opts.azure
+
+# are we running on Oracle
+ORACLE = opts.oracle
+
+def get_ip_wrapper():
+    def cb(result):
+        global HOST
+        HOST = result
+        reactor.stop()
+
+    def eb(bad):
+        reactor.stop()
+        
+    d = [ConnectivityTestClient.get_public_ip()]
+    d[0].addCallbacks(cb, eb)
+    defer.DeferredList(d)
+    reactor.run()
+
+    return d
+
+
+if EC2 or GCP or AZURE or ORACLE:
+    user_data = {}
+    if EC2:
+        user_data = get_user_dict()
+        cidr = get_cidr_list()
+    elif GCP:
+        user_data = get_user_dict_gcp()
+        cidr = get_cidr_list_gcp()
+
+    if not HOST and 'public_hostname' in user_data:
+        HOST = user_data['public_hostname']
+    elif EC2:
+        HOST = ec2_get_pub_ip()
+    elif GCP:
+        HOST = gcp_get_pub_ip()
+    elif AZURE:
+        HOST = azure_get_pub_ip()
+    elif ORACLE:
+        deferred = get_ip_wrapper()
+
+    if not LICENSE and user_data and 'license' in user_data:
+        LICENSE = user_data['license']
+
+# get AS version number
+VERSION = None
+try:
+    version_re = re.compile(r"^export AS_VERSION=([\w\.]+)")
+    for line in open("/usr/local/openvpn_as/etc/VERSION").read().splitlines():
+        m = re.match(version_re, line)
+        if m:
+            VERSION = m.groups()[0]
+            break
+except Exception:
+    pass
+
+if DEBUG:
+    print "VERSION", VERSION
+
+# Do we need to see if ovpn-init was already run, possibly successfully ?
+# TODO: Is there a better check for this ?
+if not FORCE:
+    if DEBUG:
+        print "Info:  Checking that as.conf has been created."
+    if os.path.exists("/usr/local/openvpn_as/etc/as.conf"):
+        print "Detected an existing OpenVPN-AS configuration."
+        print "Continuing will delete this configuration and restart from scratch."
+        input = get_raw_input(
+            "Please enter 'DELETE' to delete existing configuration: ")
+        if input == 'DELETE':
+            FORCE = True
+        else:
+            print "OpenVPN-AS configuration has not been modified."
+            sys.exit(3)
+
+if FORCE:
+    # Stop openvpnas if it is running
+    retv = commands.getstatusoutput('systemctl stop openvpnas')
+    
+# Show welcome message...
+print
+print "          OpenVPN Access Server"
+print "          Initial Configuration Tool"
+print "------------------------------------------------------"
+
+# Check if machine is capable of providing a license validation machine lock
+# TODO: remove this block after an old licensing is deprecated since we don't need
+# liman to validate the subscription
+if not LICENSE:
+    SA_CMD = "/usr/local/openvpn_as/scripts/liman valid-no-inode"
+    retv = commands.getstatusoutput(SA_CMD)
+    if DEBUG:
+        print "sa cmd=", SA_CMD, retv
+    if retv[0] != 0:
+        print "Error: Could not establish license validation machine lock."
+        print "Access Server will not be able to activate a license key on this host."
+        print "Please see http://www.openvpn.net/access-server/rd/liman-id-failed.html"
+        sys.exit(1)
+
+# do EULA
+print_eula()
+if not BATCH:
+    input = get_raw_input(
+        "Please enter 'yes' to indicate your agreement [no]: ")
+    if not input.lower().startswith('yes'):
+        print "OpenVPN-AS cannot be installed unless the EULA is agreed to."
+        sys.exit(1)
+
+# Continue welcome message
+print
+print "Once you provide a few initial configuration settings,"
+print "OpenVPN Access Server can be configured by accessing"
+print "its Admin Web UI using your Web browser."
+
+# Func to check selinux enabled...
+
+
+def check_selinux_enabled():
+    cmd = "sestatus"  # TODO: use full path ?
+    retv = commands.getstatusoutput(cmd)
+    if DEBUG:
+        print "Warning: Result of running '" + cmd + "' is ", retv
+    # command ran ok ?
+    if (retv[0] == 0):
+        # parse lines...
+        lines = retv[1].split("\n")
+        for line in lines:
+            parts = line.split(":")
+            # get the info for this line...
+            info = parts[0].strip()
+            # is it the mode line ?
+            if info == "SELinux status":
+                # get the selinux status...
+                status = parts[1].strip()
+                if DEBUG:
+                    print "Info: Got selinux status of '" + status + "'"
+                if status == "enabled":
+                    return True
+                else:
+                    return False
+    if DEBUG:
+        print "Warning: Could not determine selinux status."
+    return False
+
+
+# Check selinux enabled or not...
+selinux_enabled = check_selinux_enabled()
+
+# Func to get server network options...
+
+
+def get_network_options():
+    ifaces_to_show = []
+    ips_to_show = []
+    default_option = None
+
+    # There's always 'all interfaces'...
+    ifaces_to_show.append("all interfaces")
+    ips_to_show.append("0.0.0.0")
+    default_option = 0
+
+    # Get a NetInfoLinux object...
+    ni = NetInfoLinux()
+    interfaces = ni.enum_interfaces()
+    if DEBUG:
+        print "interfaces=", interfaces
+
+    # Got a list of interfaces?...
+    if interfaces:
+        # Got a list of interfaces, get default route...
+        try:
+            def_route = ni.get_default_route()['Iface']
+        except Exception:
+            def_route = None
+        if DEBUG:
+            print "def route=", def_route
+
+        # Make copy of interfaces and iterate...
+        iterlist = interfaces[:]
+        for interface in iterlist:
+            if DEBUG:
+                print "interface=", interface
+            # Found default, get its info...
+            if interface['name'] == def_route:
+                ifaces_to_show.append(def_route)
+                # Set it to be the default suggested iterface...
+                default_option = 1
+                if AZURE or ORACLE:
+                    interface['address'] = HOST or interface['address']
+
+                ips_to_show.append(interface['address'])
+                # Remove from list...
+                interfaces.remove(interface)
+            if interface['name'] == 'lo':
+                # We wont allow loopback as an option...
+                interfaces.remove(interface)
+
+        # Append the rest...
+        for interface in interfaces:
+            ifaces_to_show.append(interface['name'])
+            ips_to_show.append(interface['address'])
+
+    return [ifaces_to_show, ips_to_show, default_option]
+
+
+# Will this be a primary or secondary node
+if opts.secondary:
+    NODE_TYPE = "secondary"
+else:
+    while (True):
+        print
+        print "Will this be the primary Access Server node?"
+        print "(enter 'no' to configure as a backup or standby node)"
+        YN = get_raw_input("> Press ENTER for default [yes]: ")
+        if YN.lower().startswith("y") or YN == "":
+            NODE_TYPE = "primary"
+            break
+        elif YN.lower().startswith("n"):
+            NODE_TYPE = "secondary"
+            break
+        else:
+            print "Error: This response was not a valid response."
+
+
+if NODE_TYPE == "primary":
+    # Get network options for server address needed in next query section...
+    [SUGGEST_IFACES, SUGGEST_IPS, SUGGEST_OPTION] = get_network_options()
+
+    # Get the ip address/interface the user wants for the server...
+    OVPN_IP = None
+    OVPN_IFACE = None
+    LOGIN_IP = None
+    while (True):
+        print
+        print "Please specify the network interface and IP address to be"
+        print "used by the Admin Web UI:"
+        for i in range(len(SUGGEST_IFACES)):
+            print "(" + str(i+1) + ") " + \
+                SUGGEST_IFACES[i] + ": " + SUGGEST_IPS[i]
+        print "Please enter the option number from the list above (1-" + str(
+            len(SUGGEST_IFACES)) + ")."
+        input = get_raw_input(
+            "> Press Enter for default [" + str(SUGGEST_OPTION) + "]: ")
+        # strip white space...
+        input = input.strip()
+        # Check if they just hit enter...
+        if input == "":
+            # Set to default option...
+            input = str(SUGGEST_OPTION)
+        # Make sure input looks right via regex...
+        regex = re.compile('(\d+)')
+        matches = regex.match(input)
+        if matches and len(matches.groups()) == 1:
+            # Its ok...
+            pass
+        else:
+            print "Error: This is an invalid option."
+            continue
+        # Check within bounds...
+        VAL = int(input)
+        VAL = VAL - 1
+        if (VAL < 0) or (VAL >= len(SUGGEST_IPS)):
+            print "Error: This is an invalid option."
+            continue
+        # Got here so its ok...
+        OVPN_IP = SUGGEST_IPS[VAL]
+        OVPN_IFACE = SUGGEST_IFACES[VAL]
+        LOGIN_IP = OVPN_IP
+        # Do some adjustments for 'all interfaces' option...
+        if OVPN_IFACE.lower().startswith('all'):
+            OVPN_IFACE = 'all'
+            LOGIN_IP = SUGGEST_IPS[1]
+        break
+
+    if HOST:
+        LOGIN_IP = HOST
+
+    if DEBUG:
+        print "OVPN_IP=", OVPN_IP
+    if DEBUG:
+        print "OVPN_IFACE=", OVPN_IFACE
+    if DEBUG:
+        print "LOGIN_IP=", LOGIN_IP
+
+    # Get the default openvpn port...
+    SUGGEST_PORT = DEFAULT_OVPN_PORT
+
+    # Get the port the user wants, with error checking...
+    OVPN_PORT = None
+    while (True):
+        print
+        print "Please specify the port number for the Admin Web UI."
+        input = get_raw_input(
+            "> Press ENTER for default [" + SUGGEST_PORT + "]: ")
+        input = input.strip()
+        if input == "":
+            OVPN_PORT = SUGGEST_PORT
+            break
+        # Make sure it looks right via regex...
+        regex = re.compile('(\d+)')
+        matches = regex.match(input)
+        if matches and len(matches.groups()) == 1:
+            OVPN_PORT = input
+            break
+        else:
+            print "Error: This is an invalid port."
+
+    # get OpenVPN daemon port
+    def default_ovpnd_port():
+        try443 = test_port(socket.SOCK_STREAM, 443)
+        if try443:
+            return "443"
+        else:
+            return "1194"
+
+    OVPND_PORT = None
+    SUGGEST_PORT = default_ovpnd_port()
+    while (True):
+        print
+        print "Please specify the TCP port number for the OpenVPN Daemon"
+        input = get_raw_input(
+            "> Press ENTER for default [" + SUGGEST_PORT + "]: ")
+        input = input.strip()
+        if input == "":
+            OVPND_PORT = SUGGEST_PORT
+            break
+        # Make sure it looks right via regex...
+        regex = re.compile('(\d+)')
+        matches = regex.match(input)
+        if matches and len(matches.groups()) == 1:
+            OVPND_PORT = input
+            break
+        else:
+            print "Error: This is an invalid port."
+
+    def query_bool_setting(prompt, default_value, nonquery, nonquery_value, cloud_key, cloud_default):
+        ret = nonquery_value
+        if not nonquery:
+            while (True):
+                print
+                print prompt
+                if EC2 or GCP:
+                    default = cloud_bool(cloud_key, cloud_default)
+                else:
+                    default = default_value
+                default_show = ''
+                if default == 'false':
+                    default_show = 'no'
+                elif default == 'true':
+                    default_show = 'yes'
+                YN = get_raw_input(
+                    "> Press ENTER for default [%s]: " % (default_show,))
+                if YN == "":
+                    ret = default
+                    break
+                elif YN.lower().startswith("y"):
+                    ret = "true"
+                    break
+                elif YN.lower().startswith("n"):
+                    ret = "false"
+                    break
+                else:
+                    print "Error: This response was not a valid response."
+        return ret
+
+    REROUTE_GW = query_bool_setting("Should client traffic be routed by default through the VPN?",
+                                    'true', opts.no_reroute_gw, 'false', 'reroute_gw', 'false')
+    REROUTE_DNS = query_bool_setting("Should client DNS traffic be routed by default through the VPN?",
+                                     'true', opts.no_reroute_dns, 'false', 'reroute_dns', 'false')
+    AUTH_MODULE = 'local' if query_bool_setting(
+        "Use local authentication via internal DB?", 'true', opts.local_auth, 'true', 'local_auth', 'true') == 'true' else 'pam'
+
+    PRIVATE_ACCESS = "no"
+    PRIVATE_NETS = ()
+    if not opts.no_private:
+        priv_nets = ()
+        if EC2 or GCP:
+            if cidr:
+                priv_nets = cidr
+        else:
+            priv_nets = NetInfoLinux.get_priv_subnets()
+        if priv_nets:
+            print
+            print "Private subnets detected: %r" % (priv_nets,)
+        while (True):
+            print
+            print "Should private subnets be accessible to clients by default?"
+            if EC2:
+                YN = get_raw_input("> Press ENTER for EC2 default [yes]: ")
+            elif GCP:
+                YN = get_raw_input("> Press ENTER for GCP default [yes]: ")
+            else:
+                YN = get_raw_input("> Press ENTER for default [yes]: ")
+            if YN.lower().startswith("y") or YN == "":
+                PRIVATE_ACCESS = "nat"
+                PRIVATE_NETS = priv_nets
+                break
+            elif YN.lower().startswith("n"):
+                break
+            else:
+                print "Error: This response was not a valid response."
+
+# Eventually, this var gets filled with the admins we want to enable...
+ADMINS = []
+
+ADMIN_USER = "openvpn"
+if (EC2 or GCP) and 'admin_user' in user_data:
+    ADMIN_USER = user_data['admin_user']
+
+print
+print "To initially login to the Admin Web UI, you must use a"
+print "username and password that successfully authenticates you"
+print "with the host UNIX system (you can later modify the settings"
+print "so that RADIUS or LDAP is used for authentication instead)."
+print
+print 'You can login to the Admin Web UI as "%s" or specify' % (ADMIN_USER,)
+print "a different user account to use for this purpose."
+
+# Do they want to enable specific admin account ?
+PW_SET = False
+while(True):
+    print
+    print 'Do you wish to login to the Admin UI as "%s"?' % (ADMIN_USER,)
+    YN = get_raw_input("> Press ENTER for default [yes]: ")
+    if YN.lower().startswith("y") or YN == "":
+        if GCP and 'pwdgen' in user_data:
+            PW_SET = True
+            ADMINS.append([ADMIN_USER, user_data['pwdgen']])
+        elif (EC2 or GCP) and 'admin_pw' in user_data:
+            ADMINS.append([ADMIN_USER, user_data['admin_pw']])
+            PW_SET = True
+        else:
+            ADMINS.append([ADMIN_USER])
+        break
+    elif YN.lower().startswith("n"):
+        break
+    else:
+        print "Error: This response was not a valid response."
+
+# Function to determine if user exists...
+
+
+def user_exists(user):
+    # Check this user exists...
+    try:
+        pwd.getpwnam(user)
+        return True
+    except:
+        return False
+
+
+def group_exists(group):
+    import grp
+    try:
+        grp.getgrnam(group)
+        return True
+    except KeyError:
+        return False
+
+
+# Func to escape slash and double quote in raw strings...
+def esc_str(str):
+    # Escape the slash...
+    outstr = str.replace("\\", "\\\\")
+    # Escape the quote...
+    outstr = outstr.replace("\"", "\\\"")
+    return outstr
+
+
+# If not root enabled, user must choose an existing/or must create a new account...
+passw = ''
+while (len(ADMINS) == 0):
+    print
+    OTHER_LOGIN = get_raw_input(
+        "> Specify the username for an existing user or for the new user account: ")
+    OTHER_LOGIN = OTHER_LOGIN.strip()
+    OTHER_LOGIN = esc_str(OTHER_LOGIN)
+
+    # Does it already exist?...
+    if (user_exists(OTHER_LOGIN)):
+        # TODO: Do we want to validate the password for this user?...
+        print "Note: This user already exists."
+        ADMINS.append([OTHER_LOGIN, None])
+        break
+
+    if group_exists(OTHER_LOGIN):
+        print("The group for this user already exists, please specify another username")
+        continue
+
+    # Else, this user does not exist and so we will create a new user...
+
+    # Check invalid strings for this user...
+    regex = re.compile('[a-zA-Z0-9_\s]+')
+    matches = regex.match(OTHER_LOGIN)
+    if not matches:
+        print "Error: This is an invalid username"
+        continue
+
+    # Checks out, get password...
+    for i in range(3):
+        passw = esc_str(getpass.getpass(
+            "Type the password for the '" + OTHER_LOGIN + "' account:"))
+        passw_confirm = esc_str(getpass.getpass(
+            "Confirm the password for the '" + OTHER_LOGIN + "' account:"))
+
+        if passw and passw_confirm:
+            if passw == passw_confirm:
+                PW_SET = True
+                break
+            print "Error: passwords do not match"
+        else:
+            print "Error: passwords may not be blank"
+
+    else:
+        print "Error: password confirmation failure"
+        continue
+
+    # Everything is ok...
+    ADMINS.append([OTHER_LOGIN, passw])
+
+N_CORES = get_n_cores()
+
+if NODE_TYPE == "primary":
+    # Keys to be replaced in config-local.json...
+    config_db_dict = {
+        "host.name": LOGIN_IP,
+        "admin_ui.https.ip_address": OVPN_IFACE,
+        "admin_ui.https.port": OVPN_PORT,
+        "cs.https.ip_address": OVPN_IFACE,
+        "cs.https.port": OVPN_PORT,
+        "vpn.daemon.0.listen.ip_address": OVPN_IFACE,
+        "vpn.daemon.0.server.ip_address": OVPN_IFACE,
+        "vpn.daemon.0.listen.port": OVPND_PORT,
+        "vpn.client.routing.reroute_gw": REROUTE_GW,
+        "vpn.client.routing.reroute_dns": REROUTE_DNS,
+        "vpn.server.routing.private_access": PRIVATE_ACCESS,
+        "vpn.server.daemon.tcp.port": OVPND_PORT,
+        "vpn.server.daemon.tcp.n_daemons": N_CORES,
+        "vpn.server.daemon.udp.n_daemons": N_CORES,
+        }
+
+
+def generate_configdb_local_json():
+    # Generate the config_local DB JSON initialization
+    data = json.JSONDecoder().decode(read_string_from_file(JSON_TEMPL_CONF_LOCAL))
+    default = data['Default']
+    default.update(config_db_dict)
+
+    if PRIVATE_ACCESS == 'nat':
+        for i, sn in enumerate(PRIVATE_NETS):
+            default["vpn.server.routing.private_network.%d" % (i,)] = sn
+
+    jtxt = json.JSONEncoder(sort_keys=True, indent=2).encode(data)
+    write_string_to_file(jtxt, JSON_CONF_LOCAL)
+
+
+def generate_configdb_json():
+    # Generate the config DB JSON initialization
+    data = json.JSONDecoder().decode(read_string_from_file(JSON_TEMPL_CONF))
+    default = data['Default']
+    default.update({"auth.module.type": AUTH_MODULE})
+    jtxt = json.JSONEncoder(sort_keys=True, indent=2).encode(data)
+    write_string_to_file(jtxt, JSON_CONF)
+
+
+
+def wait_for_result(d):
+    """Iterate twisted reactor to get deferred result"""
+    while not d.called:
+        time.sleep(0.05)
+        reactor.iterate()
+
+
+def check_subscription(key):
+    subhelper = SubscriptionHelper()
+    d = subhelper.check_subscription(key)
+
+    def check_cb(reply):
+        if isinstance(reply, dict):
+            if reply.get('error'):
+                print(reply['error'])
+                return False
+            else:
+                valid, msg = SubscriptionTracking.get_subscription_message(reply['state'])
+                if not valid:
+                   print(msg)
+                return valid
+        return True
+
+    if check_cb(d):  # check_subscription can return deferred or dict with error
+        d.addCallback(check_cb)
+        return d
+
+
+def activate_subscription(key):
+    """Check subscription key.
+    @return: True if it os valid subscription key;
+    """
+    d = check_subscription(key)
+    if d:
+        wait_for_result(d)
+        res = d.result
+        if res:  # Subscription is valid
+            config_db_dict['subscription.bundle'] = key
+            print("Activation succeeded")
+            return True
+    print('Activation failed')
+
+
+def activate_license(lic):
+    cmd = "/usr/local/openvpn_as/scripts/liman -d /usr/local/openvpn_as/etc/licenses Activate '%s'" % lic
+    retv = commands.getstatusoutput(cmd)
+    if retv[0] == 0:
+        print("Activation succeeded")
+        return True
+    else:
+        print("Activation failed\n{}\n{}".format(cmd, retv))
+
+
+def activate_as(lic):
+    """Activate the AS with Subscription or License key.
+    Skip activation when no key provided.
+    Skip activation after the first input in batch mode.
+    """
+
+    while True:
+        print
+        key = get_raw_input(
+            "> Please specify your Activation key (or leave blank to specify later): ",
+            lic)
+        if not key:
+            break
+
+        try:
+            LicenseKeyString.validate(key)
+            if activate_license(key):
+                break
+        except:
+            if activate_subscription(key):
+                break
+
+        if BATCH:
+            break
+
+
+activate_as(LICENSE)
+
+
+print
+print
+print
+print "Initializing OpenVPN..."
+
+print "Removing Cluster Admin user login..."
+cmd = 'userdel "admin_c"'
+print cmd
+retv = commands.getstatusoutput(cmd)
+
+# Func to set password for a user...
+
+
+def set_pass(user, passw):
+    cmd = '/usr/local/openvpn_as/scripts/ovpnpasswd -u "' + \
+        user + '"  -p "' + passw + '"'
+    #if DEBUG: print "set password cmd=", cmd
+    retv = commands.getstatusoutput(cmd)
+    if ((retv[0] != 0) and (ret[1] != 'SUCCEED')):
+        if DEBUG:
+            print "result of set password cmd=", retv
+        return False
+    else:
+        return True
+
+
+# Here's where we add a new account (ie, not 'root' or enabling an existing account)...
+if (ADMINS[0][0] != 'root'):
+    if DEBUG:
+        print ADMINS
+    print "Adding new user login..."
+    cmd = 'useradd -s /sbin/nologin "' + ADMINS[0][0] + '"'
+    print cmd
+    if not user_exists(ADMINS[0][0]):
+        retv = commands.getstatusoutput(cmd)
+        if (retv[0] != 0):
+            print "Error: Could not add user " + ADMINS[0][0]
+            if DEBUG:
+                print "Error: adduser failed with error->", retv
+            sys.exit(1)
+
+        # Set password (ignore deprecation warning for popen)...
+        if PW_SET and ((len(ADMINS[0]) > 1) and (ADMINS[0][1] != None)):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                retv = set_pass(ADMINS[0][0], ADMINS[0][1])
+                if (not retv):
+                    print "Error: Could not set password"
+                    sys.exit(1)
+
+# Keys to be replaced in as.conf...
+dict = {
+    "boot_pam_users.0": None,
+    "boot_pam_users.1": None,
+    "boot_pam_users.2": None,
+    "boot_pam_users.3": None,
+    "boot_pam_users.4": None,
+    "auth.pam.0.service": "sshd",
+    "db_startup_wait": None,
+    "node_type": None,
+}
+
+# Set web admins...
+pam_ct = 0
+for admin in ADMINS:
+    key = "boot_pam_users." + str(pam_ct)
+    if DEBUG:
+        print "setting key=", key
+    dict[key] = admin[0]
+    pam_ct += 1
+
+# DB startup wait is only needed on secondary nodes, since
+# the daemon may start up before the DB files are in place
+if NODE_TYPE == "secondary":
+    dict['db_startup_wait'] = '1000000'
+    dict['node_type'] = 'SECONDARY'
+
+# Open the template config...
+f = open(AS_TEMPL_CONF)
+lines = f.readlines()
+f.close()
+
+# Replace config items with dictionary items...
+for a in range(len(lines)):
+    line = lines[a]
+    parts = line.split("=")
+    if len(parts) != 2:
+        continue
+    key = parts[0].replace("#", "").strip()
+    # if dict.has_key(key):
+    if key in dict:
+        new_line = line
+        val = dict[key]
+        if val is None:
+            new_line = "# " + line
+        else:
+            new_line = key + "=" + val
+        if new_line[-1] != "\n":
+            new_line = new_line + "\n"
+        lines[a] = new_line
+
+# Write the new as config file...
+print "Writing as configuration file..."
+f = open(AS_CONF, 'w')
+f.writelines(lines)
+f.close()
+
+# Make as.conf readable/writable by root only
+# SA_CMD = "chmod 600 %s" % AS_CONF
+# retv = commands.getstatusoutput(SA_CMD)
+# if DEBUG:
+#     print "sa cmd=", SA_CMD, retv
+# if retv[0] != 0:
+#     print "Error: Could not change as.conf permissions"
+
+
+if NODE_TYPE == "primary":
+    generate_configdb_local_json()
+    generate_configdb_json()
+    # Execute sa...
+    print "Perform sa init..."
+    SA_CMD = "/usr/local/openvpn_as/scripts/sa -s 2048 init"
+    retv = commands.getstatusoutput(SA_CMD)
+    if DEBUG:
+        print "sa cmd=", SA_CMD, retv
+    if retv[0] != 0:
+        print "Error: Could not initialize sa."
+        sys.exit(1)
+
+    # Execute userdb wipe...
+    print "Wiping any previous userdb..."
+    USERDBA_CMD = "/usr/local/openvpn_as/scripts/userdba --wipe"
+    retv = commands.getstatusoutput(USERDBA_CMD)
+    if DEBUG:
+        print "userdba cmd=", USERDBA_CMD, retv
+    if retv[0] != 0:
+        print "Error: Could not wipe userdb."
+        sys.exit(1)
+
+    # Execute userdb default profile...
+    print "Creating default profile..."
+    USERDBA_CMD2 = "/usr/local/openvpn_as/scripts/userdba --mkuser --def"
+    retv = commands.getstatusoutput(USERDBA_CMD2)
+    if DEBUG:
+        print "userdba cmd=", USERDBA_CMD2, retv
+    if retv[0] != 0:
+        print "Error: Could not create default profile."
+        sys.exit(1)
+
+    # Execute userdb default profile...
+    print "Modifying default profile..."
+    USERDBA_CMD3 = "/usr/local/openvpn_as/scripts/userdba --def --mod --prop autogenerate --enable"
+    retv = commands.getstatusoutput(USERDBA_CMD3)
+    if DEBUG:
+        print "userdba cmd=", USERDBA_CMD3, retv
+    if retv[0] != 0:
+        print "Error: Could not modify default profile."
+        sys.exit(1)
+
+    # Execute mkuser...
+    print "Adding new user to userdb..."
+    USERDBA_CMD4 = '/usr/local/openvpn_as/scripts/userdba --mkuser --user "' + \
+        ADMINS[0][0] + '"'
+    retv = commands.getstatusoutput(USERDBA_CMD4)
+    if DEBUG:
+        print "userdba cmd=", USERDBA_CMD4, retv
+    if retv[0] != 0:
+        print "Error: Could not add user to userdb."
+        sys.exit(1)
+
+    # Modify superuser...
+    print "Modifying new user as superuser in userdb..."
+    USERDBA_CMD5 = '/usr/local/openvpn_as/scripts/userdba --user "' + \
+        ADMINS[0][0] + '" --mod --prop superuser --enable'
+    retv = commands.getstatusoutput(USERDBA_CMD5)
+    if DEBUG:
+        print "userdba cmd=", USERDBA_CMD5, retv
+    if retv[0] != 0:
+        print "Error: Could not modify user as superuser in userdb."
+        sys.exit(1)
+
+    # Execute sa for web certs...
+    print "Getting hostname..."
+    HOSTNAME = HOST if HOST else commands.getoutput("hostname")
+    print "Hostname: %s" % HOSTNAME
+    HOSTNAME = esc_str(HOSTNAME)
+    print "Preparing web certificates..."
+    web_ssl = "/usr/local/openvpn_as/etc/web-ssl"
+    certool = "/usr/local/openvpn_as/scripts/certool"
+    SA_CMD1 = '%s -d %s -k 2048 --type ca --unique --cn "OpenVPN Web CA"' % (
+        certool, web_ssl)
+    SA_CMD2 = '%s -d %s -k 2048 --type server --remove_csr --sn_off --serial 1 --name server --cn "%s"' % (
+        certool, web_ssl, HOSTNAME)
+    retv1 = commands.getstatusoutput(SA_CMD1)
+    retv2 = commands.getstatusoutput(SA_CMD2)
+    if DEBUG:
+        print "sa web cert cmd =", SA_CMD1, retv1
+        print "sa web cert cmd =", SA_CMD1, retv2
+    if retv1[0] != 0 or retv2[0] != 0:
+        print "Error: Could not initialize web certs."
+        sys.exit(1)
+
+# Execute web user...
+print "Getting web user account..."
+CMD1 = "/usr/local/openvpn_as/scripts/confdba --static --key cs.user"
+retv = commands.getstatusoutput(CMD1)
+if DEBUG:
+    print "getting web user acct cmd=", CMD1, retv
+if retv[0] != 0:
+    print "Error: Could not get web user account."
+    sys.exit(1)
+# Extract the web user acct from response...
+web_user = retv[1]
+web_user = esc_str(web_user)
+
+# Execute web group...
+print "Adding web group account..."
+CMD2 = "/usr/local/openvpn_as/scripts/confdba --static --key cs.group"
+retv = commands.getstatusoutput(CMD2)
+if DEBUG:
+    print "adding web group account cmd=", CMD2, retv
+if retv[0] != 0:
+    print "Error: Could not add web group account."
+    sys.exit(1)
+# Extract the web group acct from response...
+web_group = retv[1]
+web_group = esc_str(web_group)
+
+# Execute web account user add...
+if not user_exists(web_user):
+    print "Adding web user account..."
+    CMD3 = 'useradd -s /sbin/nologin "' + web_user + '"'
+    retv = commands.getstatusoutput(CMD3)
+    if DEBUG:
+        print "adding web user acct cmd=", CMD3, retv
+    if retv[0] != 0:
+        print "Error: Could not execute web user account useradd.", retv
+        sys.exit(1)
+
+# Add web_group ...
+print "Adding web group..."
+ADDGRP = 'groupadd "' + web_group + '"'
+retv = commands.getoutput(ADDGRP)
+if DEBUG:
+    print "adding web group cmd=", ADDGRP, retv
+
+# Execute chown...
+print "Adjusting license directory ownership..."
+CMD4 = "chown -R " + web_user + "." + '"' + \
+    web_group + '" /usr/local/openvpn_as/etc/licenses'
+retv = commands.getstatusoutput(CMD4)
+if DEBUG:
+    print "chown cmd=", CMD4, retv
+if retv[0] != 0:
+    print "Error: Could not execute chown on license directory."
+    sys.exit(1)
+
+# Execute userdb init...
+if NODE_TYPE == "primary":
+    print "Initializing confdb..."
+
+    CONF_INIT = "/usr/local/openvpn_as/scripts/confdba --local --load --file /usr/local/openvpn_as/etc/config-local.json"
+    retv = commands.getstatusoutput(CONF_INIT)
+
+    if DEBUG:
+        print "confdba init cmd=", CONF_INIT, retv
+    if retv[0] != 0:
+        print "Error: Could not initialize confdb_local."
+        sys.exit(1)
+
+    CONF_INIT = "/usr/local/openvpn_as/scripts/confdba  --load --file /usr/local/openvpn_as/etc/config.json"
+    retv = commands.getstatusoutput(CONF_INIT)
+    if DEBUG:
+        print "confdba init cmd=", CONF_INIT, retv
+    if retv[0] != 0:
+        print "Error: Could not initialize confdb."
+        sys.exit(1)
+
+# Generate PAM config
+print "Generating PAM config..."
+GENPAM = "/usr/local/openvpn_as/scripts/openvpnas_gen_pam"
+retv = commands.getstatusoutput(GENPAM)
+if DEBUG:
+    print "gen pam cmd=", GENPAM, retv
+if retv[0] != 0:
+    print "Error: Could not generate PAM config."
+    sys.exit(1)
+
+print("Enabling service")
+enableOVPN="systemctl enable openvpnas"
+# Workaround for bug in RHEL7
+retv = commands.getstatusoutput("systemctl daemon-reexec")
+# 
+retv = commands.getstatusoutput(enableOVPN)
+if retv[0] != 0:
+    print("Error: Could not execute '%s' to enable startup/shutdown scripts" % enableOVPN)
+    sys.exit(1)
+if DEBUG:
+    print "enable openvpnas cmd=", enableOVPN, retv
+
+# Perform iptables command to force initialization...
+IPTABLES_NULL = "iptables --list"
+retv = commands.getstatusoutput(IPTABLES_NULL)
+if retv[0] != 0:
+    print "Warning: Iptables list command failed.  Iptables may not be properly initialized."
+if DEBUG:
+    print "iptables null cmd=", IPTABLES_NULL, retv
+
+# Start the server daemon...
+if not opts.no_start:
+    if NODE_TYPE == "primary":
+        print "Starting openvpnas..."
+        INIT = "systemctl start openvpnas"
+        retv = commands.getstatusoutput(INIT)
+        if DEBUG:
+            print "server init=", retv
+        if retv[0] != 0:
+            print "Error: Could not execute server start."
+            sys.exit(1)
+
+    # Print exit messages...
+    print
+    print "NOTE: Your system clock must be correct for OpenVPN Access Server"
+    print "to perform correctly.  Please ensure that your time and date"
+    print "are correct on this system."
+    print
+    print "Initial Configuration Complete!"
+    if False and selinux_enabled:  # disable selinux warnings for now
+        print
+        print "WARNING: It appears you have SELinux enabled currently."
+        print
+        print "Note that while OpenVPN-AS does not currently support"
+        print "SELinux, support is planned for a future release."
+        print "You can disable SELinux by changing the SELINUX line in"
+        print "/etc/selinux/config to read:"
+        print "SELINUX=disabled"
+        if NODE_TYPE == "primary":
+            print
+            print "Then after you reboot the machine, you can continue"
+            print "configuring OpenVPN Access Server by directing your"
+            print "Web browser to this URL:"
+    elif NODE_TYPE == "primary":
+        print
+        print "You can now continue configuring OpenVPN Access Server by"
+        print "directing your Web browser to this URL:"
+
+    if NODE_TYPE == "primary":
+        if EC2 and ec2_get_pub_ip():
+            LOGIN_IP = ec2_get_pub_ip()
+        elif GCP and gcp_get_pub_ip():
+            LOGIN_IP = gcp_get_pub_ip()
+        print
+        if OVPN_PORT != "443":
+            client_ui = "https://" + LOGIN_IP + ":" + OVPN_PORT + "/"
+        else:
+            client_ui = "https://" + LOGIN_IP + "/"
+        admin_ui = client_ui + "admin"
+        print admin_ui
+        print 'Login as "' + ADMINS[0][0] + \
+            '" with the same password used to authenticate'
+        print "to this UNIX host."
+        print
+        print "During normal operation, OpenVPN AS can be accessed via these URLs:"
+        print "Admin  UI:", admin_ui
+        print "Client UI:", client_ui
+
+    if NODE_TYPE == "secondary":
+        print
+        print "This node has been configured as a Secondary Access Server"
+        print "node for backup/standby.  Please continue with the redundancy"
+        print "configuration on the Primary Access Server node."
+
+    if VERSION:
+        print
+        print "See the Release Notes for this release at:"
+        print "   https://openvpn.net/vpn-server-resources/release-notes/"
+        print
+

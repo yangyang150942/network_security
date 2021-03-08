@@ -1,0 +1,13 @@
+[Unit]
+Description=Mount unit for core18, revision 1988
+Before=snapd.service
+
+[Mount]
+What=/var/lib/snapd/snaps/core18_1988.snap
+Where=/snap/core18/1988
+Type=squashfs
+Options=nodev,ro,x-gdu.hide
+LazyUnmount=yes
+
+[Install]
+WantedBy=multi-user.target

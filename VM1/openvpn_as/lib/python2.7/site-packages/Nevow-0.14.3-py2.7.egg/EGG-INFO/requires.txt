@@ -1,0 +1,4 @@
+twisted>=13.0
+
+[doc]
+Sphinx

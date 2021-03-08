@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+
+# upgrade DB schema from AS 1.3.x or earlier to AS 1.8.2
+
+AS=/usr/local/openvpn_as
+if [ -e "$AS/etc/db/userprop.db" ]; then
+    # add and populate userprop type column
+    $AS/scripts/sqlite3 $AS/etc/db/userprop.db "ALTER TABLE profile ADD type VARCHAR(128)"
+    $AS/scripts/confdba -u --assign_type
+
+    # userprop schema updates
+    $AS/scripts/confdba -u --src_key vpn_ip --dest_key conn_ip --copy_key
+    $AS/scripts/confdba -u --src_key group_dynamic_range --dest_key group_range.0 --copy_key
+
+    # perform __DEFAULT__.prop_deny -> __DEFAULT__.def_deny transformation
+    $AS/scripts/confdba -u --def_deny_update
+
+    # add indexes
+    $AS/scripts/sqlite3 $AS/etc/db/userprop.db "CREATE INDEX ix_profile_id ON profile (id)"
+    $AS/scripts/sqlite3 $AS/etc/db/userprop.db "CREATE UNIQUE INDEX ix_profile_name ON profile (name)"
+    $AS/scripts/sqlite3 $AS/etc/db/userprop.db "CREATE INDEX ix_profile_type ON profile (type)"
+    $AS/scripts/sqlite3 $AS/etc/db/userprop.db "CREATE INDEX ix_config_profile_id ON config (profile_id)"
+    $AS/scripts/sqlite3 $AS/etc/db/userprop.db "CREATE INDEX ix_config_name ON config (name)"
+fi
+if [ -e "$AS/etc/db/config.db" ]; then
+    $AS/scripts/sqlite3 $AS/etc/db/config.db "ALTER TABLE profile ADD type VARCHAR(128)"
+fi
+if [ -e "$AS/etc/db/certs.db" ]; then
+    $AS/scripts/sqlite3 $AS/etc/db/certs.db "ALTER TABLE certificates ADD autologin BOOLEAN" &>/dev/null
+    $AS/scripts/sqlite3 $AS/etc/db/certs.db "CREATE UNIQUE INDEX ix_certificates_common_name ON certificates (common_name)"
+    $AS/scripts/sqlite3 $AS/etc/db/certs.db "CREATE UNIQUE INDEX ix_certificates_serial_number ON certificates (serial_number)"
+    $AS/scripts/sqlite3 $AS/etc/db/certs.db "CREATE INDEX ix_certificates_username ON certificates (username)"
+fi
+if [ -e "$AS/etc/db/log.db" ]; then
+    $AS/scripts/sqlite3 $AS/etc/db/log.db "ALTER TABLE log ADD proto VARCHAR(3)" &>/dev/null
+    $AS/scripts/sqlite3 $AS/etc/db/log.db "ALTER TABLE log ADD port VARCHAR(5)" &>/dev/null
+    $AS/scripts/sqlite3 $AS/etc/db/log.db "ALTER TABLE log ADD node VARCHAR(128)" &>/dev/null
+    $AS/scripts/sqlite3 $AS/etc/db/log.db "ALTER TABLE log ADD timestamp INTEGER" &>/dev/null
+    $AS/scripts/sqlite3 $AS/etc/db/log.db "CREATE INDEX ix_log_vpn_ip ON log (vpn_ip)"
+    $AS/scripts/sqlite3 $AS/etc/db/log.db "CREATE INDEX ix_log_username ON log (username)"
+    $AS/scripts/sqlite3 $AS/etc/db/log.db "CREATE INDEX ix_log_session_id ON log (session_id)"
+    $AS/scripts/sqlite3 $AS/etc/db/log.db "CREATE INDEX ix_log_start_time ON log (start_time)"
+    $AS/scripts/sqlite3 $AS/etc/db/log.db "CREATE INDEX ix_log_service ON log (service)"
+    $AS/scripts/sqlite3 $AS/etc/db/log.db "CREATE INDEX ix_log_real_ip ON log (real_ip)"
+fi

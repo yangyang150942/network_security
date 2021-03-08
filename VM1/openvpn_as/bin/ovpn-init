@@ -1,0 +1,17 @@
+#!/bin/bash
+
+# Check root is running this...
+if [ "$(id -u)" != "0" ]; then
+echo Error: You must be root to run this. 2>&1
+exit 1
+fi
+
+# Setup pyovpn env vars...
+. /usr/local/openvpn_as/exports
+
+# Needed for certain operations inside the python script...
+export CONFIG_JSON=/usr/local/openvpn_as/etc/config.json
+export WIN_INSTALL=/usr/local/openvpn_as/etc/exe/OpenVPN_Installer.exe
+
+# Execute the python script...
+python2 /usr/local/openvpn_as/bin/_ovpn-init "$@"

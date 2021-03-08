@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Welcome
+Exec=/usr/libexec/gnome-welcome-tour
+AutostartCondition=if-exists run-welcome-tour
+OnlyShowIn=GNOME;
+NoDisplay=true
+X-GNOME-HiddenUnderSystemd=true
+X-Ubuntu-Gettext-Domain=gnome-initial-setup
