@@ -1,5 +1,5 @@
 # EP2520_ACME_Project
-Repository for a project of the course EP2520 Building Networked Systems Security in Royal Institute of Technology, Stockholm (KTH).<br>
+Repository for a project of the course EP2520 Building Networked Systems Security in Royal Institute of Technology (KTH), Stockholm.<br>
 ## VM1
 This VM is used as a VPN access server. And there is an intrusion detection for interface enp0s3.<br>
 For IDS, you can just copy the etc folder in your VM and use the command:<br>
